@@ -297,3 +297,57 @@ class TestUnconnectedPlatformKeepsItsBudget:
         )
         assert _row("ob-1")["attempts"] == 0
 
+
+
+class TestRerecordIdempotence:
+    """``compute_obligation_id`` promises that the same turn replying with the
+    same text "re-records idempotently". The same id is what a platform
+    redelivering an inbound event produces, so the re-record has to preserve a
+    terminal state — otherwise the ledger that exists to prevent duplicate
+    delivery schedules one.
+    """
+
+    def test_delivered_survives_a_re_record(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        dl.mark_delivered("ob-1")
+
+        _record()
+
+        assert _row("ob-1")["state"] == "delivered"
+
+    def test_abandoned_survives_a_re_record(self):
+        _record()
+        dl._update_state("ob-1", "abandoned")
+
+        _record()
+
+        assert _row("ob-1")["state"] == "abandoned"
+
+    def test_a_delivered_obligation_is_not_swept_after_a_re_record(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        dl.mark_delivered("ob-1")
+        _record()
+        _orphan("ob-1")
+
+        claimed = dl.sweep_recoverable(deliverable_platforms={"slack"})
+
+        assert [c["obligation_id"] for c in claimed] == [], (
+            "an already-delivered reply was handed back for redelivery"
+        )
+
+    def test_an_in_flight_row_is_still_re_stamped(self):
+        """The intended behaviour is untouched: a row that never reached a
+        terminal state is reclaimed by the recording process."""
+        _record()
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+
+        _record(content="the final answer, again")
+
+        row = _row("ob-1")
+        assert row["state"] == "pending"
+        assert row["attempts"] == 0
+        assert row["owner_pid"] != 999999999
+        assert row["content"] == "the final answer, again"

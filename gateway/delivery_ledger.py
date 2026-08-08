@@ -194,16 +194,41 @@ def record_obligation(
     thread_id: Optional[str],
     content: str,
 ) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+    """Record a final response as owed to the platform (state='pending').
+
+    Re-recording the same obligation is idempotent, per
+    :func:`compute_obligation_id`: the same turn answering with the same text
+    lands on the same id, which is what happens whenever a platform redelivers
+    an inbound event. ``INSERT OR REPLACE`` rewrote every column, so a row
+    already marked ``delivered`` (or ``abandoned``) dropped back to
+    ``pending`` with ``attempts`` reset — and after a restart the sweep owed a
+    message the user had already received, from the ledger whose whole job is
+    to stop exactly that.
+
+    Terminal rows keep their state; a row still in flight is re-stamped with
+    this process's ownership as before.
+    """
     now = time.time()
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+               ON CONFLICT(obligation_id) DO UPDATE SET
+                   session_key = excluded.session_key,
+                   platform = excluded.platform,
+                   chat_id = excluded.chat_id,
+                   thread_id = excluded.thread_id,
+                   content = excluded.content,
+                   state = 'pending',
+                   attempts = 0,
+                   updated_at = excluded.updated_at,
+                   owner_pid = excluded.owner_pid,
+                   owner_started_at = excluded.owner_started_at
+               WHERE delivery_obligations.state NOT IN ('delivered', 'abandoned')""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
              pid, started),
